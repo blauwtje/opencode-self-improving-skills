@@ -238,6 +238,24 @@ function bumpUsage(skill: string, kind: "use" | "view" | "patch"): void {
   } catch { /* best-effort */ }
 }
 
+// A record can be created before its SKILL.md is on disk (a brand-new skill is
+// bumped during `execute.before`), and then `created_by` falls back to "user"
+// because the frontmatter cannot be read yet. Re-derive it after validation
+// succeeds, so agent-distilled skills land on the auto-archive path and are
+// not mistaken for hand-authored ones.
+function reseedCreatedBy(skill: string): void {
+  try {
+    const data = loadUsage()
+    const rec = data[skill] as UsageRecord | undefined
+    if (!rec || typeof rec !== "object" || !("use_count" in rec)) return
+    const expected = seedCreatedBy(skill)
+    if (rec.created_by !== expected) {
+      rec.created_by = expected
+      saveUsage(data)
+    }
+  } catch { /* best-effort */ }
+}
+
 function forgetMissingUsage(existing: Set<string>): void {
   try {
     const data = loadUsage()
@@ -769,9 +787,14 @@ export default Plugin.define({
         // V2's edit/write tools use `path`; V1 used `filePath`. Accept both.
         const fp = (args?.filePath ?? args?.path) as string | undefined
         if (!fp || !isSkillPath(fp)) return
-        backupsThisCall[event.id] = backupSkill(fp)
+        const backup = backupSkill(fp)
+        backupsThisCall[event.id] = backup
         const name = skillNameFromPath(fp)
-        if (name) bumpUsage(name, "view")
+        // A brand-new SKILL.md has no previous version to view, and bumping it
+        // here would create the usage record before the file exists, pinning
+        // `created_by` to "user" forever. Defer record creation to
+        // execute.after, once validation has passed.
+        if (name && backup) bumpUsage(name, "view")
       } catch {
         // best-effort — never block the tool
       }
@@ -835,6 +858,7 @@ export default Plugin.define({
             } else if (name) {
               // Valid — bump patch_count, forget-missing cleanup, prune marker
               bumpUsage(name, "patch")
+              reseedCreatedBy(name)
               forgetMissingUsage(learnedSkillNames())
             }
           }
