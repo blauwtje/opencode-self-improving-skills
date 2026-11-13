@@ -745,7 +745,8 @@ export default Plugin.define({
         if (!EDIT_TOOLS.has(event.tool)) return
         // In V2 the mutable args are the hook's `input` field.
         const args = event.input as any
-        const fp = args?.filePath as string | undefined
+        // V2's edit/write tools use `path`; V1 used `filePath`. Accept both.
+        const fp = (args?.filePath ?? args?.path) as string | undefined
         if (!fp || !isSkillPath(fp)) return
         backupsThisCall[event.id] = backupSkill(fp)
         const name = skillNameFromPath(fp)
@@ -776,9 +777,11 @@ export default Plugin.define({
           failureSignals[sid] ??= `tool_error(${event.tool}): ${String(event.error?.message ?? "").slice(0, 200)}`
         }
 
-        if (event.tool === "skill" && typeof args?.name === "string") {
+        // V2's skill tool takes `{ id }`; V1 used `{ name }`. Accept both.
+        const skillName = (args?.id ?? args?.name) as unknown
+        if (event.tool === "skill" && typeof skillName === "string") {
           const learned = learnedSkillNames()
-          const name = args.name
+          const name = skillName
           if (learned.has(name)) {
             bumpUsage(name, "use")
             const state = getSessionState(sid)
@@ -795,7 +798,8 @@ export default Plugin.define({
           updateSessionState(sid, { last_file_edit_ts: nowIso(), devlog_nudged_at: null })
 
           // Validate SKILL.md after edit/write
-          const fp = args?.filePath as string | undefined
+          // V2's edit/write tools use `path`; V1 used `filePath`. Accept both.
+          const fp = (args?.filePath ?? args?.path) as string | undefined
           if (fp && isSkillPath(fp)) {
             const v = validateSkillFrontmatter(fp)
             const name = skillNameFromPath(fp)
@@ -823,8 +827,44 @@ export default Plugin.define({
     })
 
     // ── Session idle: record outcomes for skills used this session ────────
-    // V2 exposes `session.idle` on the event stream; the subscription is
-    // cancelled through the cleanup returned from `setup`.
+    // V2 exposes an `experimental.idle` session hook; `session.idle` also
+    // arrives on the event stream. Use both (the persisted `outcome_recorded`
+    // flag dedupes them) so CLI runs and TUI sessions behave the same.
+    async function recordIdleOutcome(sessionId: string): Promise<void> {
+      try {
+        const state = getSessionState(sessionId)
+        if (state.outcome_recorded) return
+        const used = state.skills_used ?? []
+        if (used.length === 0) {
+          // Do NOT set outcome_recorded here. Idle fires every turn, not just
+          // at session end. Burning the flag now would permanently disable
+          // the GEPA loop for this session.
+          return
+        }
+        const failureSignal = failureSignals[sessionId] ?? null
+        const result: "ok" | "fail" = failureSignal ? "fail" : "ok"
+        for (const skill of used) {
+          recordOutcome(skill, sessionId, result, failureSignal ?? undefined)
+        }
+        updateSessionState(sessionId, { outcome_recorded: true })
+        delete counters[sessionId]
+        delete failureSignals[sessionId]
+        try {
+          fs.appendFileSync(
+            path.join(STATE_DIR, "logs", "plugin-debug.log"),
+            JSON.stringify({ ts: nowIso(), hook: "idle", sessionID: sessionId, result, skills: used }) + "\n"
+          )
+        } catch { /* best-effort */ }
+      } catch {
+        // best-effort — never crash the event loop
+      }
+    }
+
+    await ctx.session.hook("experimental.idle", async (event) => {
+      await recordIdleOutcome(String(event.sessionID))
+    })
+
+    // The event subscription is cancelled through the cleanup returned by setup.
     const idleAbort = new AbortController()
     void (async () => {
       try {
@@ -834,26 +874,12 @@ export default Plugin.define({
         })) {
           const sessionId = String(event.data.sessionID)
           try {
-            const state = getSessionState(sessionId)
-            if (state.outcome_recorded) continue
-            const used = state.skills_used ?? []
-            if (used.length === 0) {
-              // Do NOT set outcome_recorded here. session.idle fires every
-              // turn, not just at session end. Burning the flag now would
-              // permanently disable the GEPA loop for this session.
-              continue
-            }
-            const failureSignal = failureSignals[sessionId] ?? null
-            const result: "ok" | "fail" = failureSignal ? "fail" : "ok"
-            for (const skill of used) {
-              recordOutcome(skill, sessionId, result, failureSignal ?? undefined)
-            }
-            updateSessionState(sessionId, { outcome_recorded: true })
-            delete counters[sessionId]
-            delete failureSignals[sessionId]
-          } catch {
-            // best-effort — never crash the event loop
-          }
+            fs.appendFileSync(
+              path.join(STATE_DIR, "logs", "plugin-debug.log"),
+              JSON.stringify({ ts: nowIso(), hook: "event.subscribe", event: "session.idle", sessionID: sessionId }) + "\n"
+            )
+          } catch { /* best-effort */ }
+          await recordIdleOutcome(sessionId)
         }
       } catch {
         // subscription ends on abort/unload
