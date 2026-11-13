@@ -34,8 +34,7 @@
  *   SIS_CURATE_INTERVAL_DAYS  days between auto-curator hints (default 7)
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import * as path from "path"
 import * as os from "os"
 import * as fs from "fs"
@@ -546,20 +545,6 @@ function rollbackSkill(filePath: string, backupPath: string | null): "restored" 
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Outcome detection — does the message stream signal failure?
-// ────────────────────────────────────────────────────────────────────────────
-
-const CORRECTION_PATTERNS = [
-  /\b(아니야|아닙니다|틀렸|틀린|잘못|다시\s*해|다시\s*해줘|그거\s*아니|그건\s*아니|아니라|고쳐|수정해)\b/,
-  /\b(no|wrong|incorrect|not\s+that|that'?s?\s+wrong|try\s+again|do\s+it\s+again|fix\s+this|that'?s?\s+not\s+right)\b/i,
-  /\b(still\s+broken|still\s+failing|still\s+doesn'?t\s+work|여전히\s+안|아직\s+안)\b/i,
-]
-
-function looksLikeCorrection(text: string): boolean {
-  if (!text || text.length > 5000) return false
-  return CORRECTION_PATTERNS.some(re => re.test(text))
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Curator state
 // ────────────────────────────────────────────────────────────────────────────
@@ -643,34 +628,40 @@ const GEPA_PROCEDURE = [
 // Plugin export
 // ────────────────────────────────────────────────────────────────────────────
 
-export const SelfImprovingSkills: Plugin = async ({ client }) => {
-  ensureDirs()
+export default Plugin.define({
+  id: "self-improving-skills",
+  async setup(ctx) {
+    ensureDirs()
 
-  // In-memory per-session counters (also persisted in nudge_state.json)
-  const counters: Record<string, { tool_calls: number; file_edits: number }> = {}
-  // Track which SKILL.md backups we made this call, so .after can roll back
-  const backupsThisCall: Record<string, string | null> = {}
+    // In-memory per-session counters (also persisted in nudge_state.json)
+    const counters: Record<string, { tool_calls: number; file_edits: number }> = {}
+    // Track which SKILL.md backups we made this call, so .after can roll back
+    const backupsThisCall: Record<string, string | null> = {}
+    // First tool error seen this session — the outcome signal consumed at idle
+    const failureSignals: Record<string, string> = {}
 
-  function bumpCounters(sessionId: string, tool: string, _args: any): void {
-    if (!counters[sessionId]) {
-      const persisted = getSessionState(sessionId)
-      counters[sessionId] = {
-        tool_calls: persisted.tool_calls,
-        file_edits: persisted.file_edits,
+    function bumpCounters(sessionId: string, tool: string): void {
+      if (!counters[sessionId]) {
+        const persisted = getSessionState(sessionId)
+        counters[sessionId] = {
+          tool_calls: persisted.tool_calls,
+          file_edits: persisted.file_edits,
+        }
+      }
+      counters[sessionId].tool_calls++
+      if (EDIT_TOOLS.has(tool)) {
+        counters[sessionId].file_edits++
       }
     }
-    counters[sessionId].tool_calls++
-    if (EDIT_TOOLS.has(tool)) {
-      counters[sessionId].file_edits++
-    }
-  }
 
-  return {
-    // ── Inject advisory context into every chat turn ──────────────────────
-    // This is the opencode analogue of Claude Code's SessionStart + Stop hook:
-    // it runs on every LLM call so the agent always sees current loop state.
-    "experimental.chat.system.transform": async (_input, output) => {
+    // ── Inject advisory context + pending nudge into every chat turn ──────
+    // `session.context` runs on every model request, so the agent always sees
+    // current loop state. A pending distillation nudge is folded into the same
+    // system part (V1 used a synthetic user message; V2 has no
+    // `experimental.chat.messages.transform`).
+    await ctx.session.hook("context", (event) => {
       try {
+        const currentSid = String(event.sessionID)
         const learned = countLearnedSkills()
         const lines: string[] = []
 
@@ -705,31 +696,36 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           }
         }
 
-        // Pending nudge is delivered via experimental.chat.messages.transform
-        // (synthetic last message, far more visible than a system-prompt line).
         const sessions = loadNudge().sessions
-        const currentSid = resolveSessionId(_input)
 
         // DEVLOG staleness check: if ≥3 file edits this session and DEVLOG.md
         // hasn't been touched since the last edit, nudge the agent to update it.
-        if (currentSid) {
-          const my = sessions[currentSid]
-          if (my && my.file_edits >= 3 && my.last_file_edit_ts && !my.devlog_nudged_at) {
-            try {
-              const devlogPath = path.join(process.cwd(), "DEVLOG.md")
-              if (fs.existsSync(devlogPath)) {
-                const devlogMtime = fs.statSync(devlogPath).mtimeMs
-                if (devlogMtime < Date.parse(my.last_file_edit_ts)) {
-                  lines.push(
-                    `[DEVLOG 알림] 이번 세션에서 파일 편집 ${my.file_edits}회 수행했지만 DEVLOG.md가 업데이트되지 않았습니다. ` +
-                    "AGENTS.md 규칙에 따라 작업 세션 마무리 시 DEVLOG.md에 항목을 추가하세요 " +
-                    "(날짜 / 무엇을 / 왜 이 방식 / 한계·개선 후보)."
-                  )
-                  updateSessionState(currentSid, { devlog_nudged_at: nowIso() })
-                }
+        const my = sessions[currentSid]
+        if (my && my.file_edits >= 3 && my.last_file_edit_ts && !my.devlog_nudged_at) {
+          try {
+            const devlogPath = path.join(process.cwd(), "DEVLOG.md")
+            if (fs.existsSync(devlogPath)) {
+              const devlogMtime = fs.statSync(devlogPath).mtimeMs
+              if (devlogMtime < Date.parse(my.last_file_edit_ts)) {
+                lines.push(
+                  `[DEVLOG 알림] 이번 세션에서 파일 편집 ${my.file_edits}회 수행했지만 DEVLOG.md가 업데이트되지 않았습니다. ` +
+                  "AGENTS.md 규칙에 따라 작업 세션 마무리 시 DEVLOG.md에 항목을 추가하세요 " +
+                  "(날짜 / 무엇을 / 왜 이 방식 / 한계·개선 후보)."
+                )
+                updateSessionState(currentSid, { devlog_nudged_at: nowIso() })
               }
-            } catch { /* best-effort */ }
-          }
+            }
+          } catch { /* best-effort */ }
+        }
+
+        // Pending distillation nudge (high-visibility, re-armed by counters)
+        const target = pickNudgeTarget(sessions, currentSid)
+        if (target) {
+          lines.push(buildNudgeText(target))
+          updateSessionState(target.sid, {
+            nudged_at: nowIso(),
+            last_nudge_tool_calls: target.s.tool_calls,
+          })
         }
 
         const evoHint = pickEvolutionCandidate()
@@ -737,105 +733,35 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           lines.push(evoHint)
         }
 
-        output.system.push(lines.join("\n\n"))
+        event.system.push({ type: "text", text: lines.join("\n\n") })
       } catch {
         // Advisory is best-effort — never break the chat
       }
-    },
-
-    // ── High-visibility nudge: synthetic LAST user message ────────────────
-    // The agent sees this as the final message of the context — same shape as
-    // opencode's own system-reminders — and must acknowledge it in-turn.
-    "experimental.chat.messages.transform": async (_input, output) => {
-      try {
-        if (output.messages.length === 0) return
-        const target = pickNudgeTarget(loadNudge().sessions, null)
-        if (!target) return
-        const last = output.messages[output.messages.length - 1]
-        const sid = target.sid
-        const mid = `sis-nudge-${Date.now()}`
-        output.messages.push({
-          info: {
-            id: mid,
-            sessionID: sid,
-            role: "user",
-            time: { created: Date.now() },
-            agent: last.info.role === "user" ? last.info.agent : "build",
-            model:
-              last.info.role === "user"
-                ? last.info.model
-                : { providerID: "sis", modelID: "nudge" },
-          },
-          parts: [
-            {
-              id: `${mid}-part`,
-              sessionID: sid,
-              messageID: mid,
-              type: "text",
-              text: buildNudgeText(target),
-              synthetic: true,
-            },
-          ],
-        })
-        updateSessionState(sid, {
-          nudged_at: nowIso(),
-          last_nudge_tool_calls: target.s.tool_calls,
-        })
-      } catch {
-        // best-effort — never break the chat
-      }
-    },
+    })
 
     // ── Backup before SKILL.md edits ──────────────────────────────────────
-    "tool.execute.before": async (input, output) => {
+    await ctx.tool.hook("execute.before", (event) => {
       try {
-        try {
-          const debugLogPath = path.join(STATE_DIR, "logs", "plugin-debug.log")
-          fs.appendFileSync(debugLogPath, JSON.stringify({
-            ts: new Date().toISOString(),
-            hook: "tool.execute.before",
-            tool: input.tool,
-            output_args_keys: output?.args ? Object.keys(output.args) : null,
-          }) + "\n")
-        } catch {}
-
-        if (!EDIT_TOOLS.has(input.tool)) return
-        // In the before-hook the SDK passes args via OUTPUT (mutable), not
-        // input — reading input.args silently yields undefined and skips the
-        // backup entirely (2026-08-17 data-loss root cause).
-        const args = output?.args ?? (input as any).args
+        if (!EDIT_TOOLS.has(event.tool)) return
+        // In V2 the mutable args are the hook's `input` field.
+        const args = event.input as any
         const fp = args?.filePath as string | undefined
         if (!fp || !isSkillPath(fp)) return
-        backupsThisCall[input.callID] = backupSkill(fp)
+        backupsThisCall[event.id] = backupSkill(fp)
         const name = skillNameFromPath(fp)
         if (name) bumpUsage(name, "view")
       } catch {
         // best-effort — never block the tool
       }
-    },
+    })
 
     // ── Validate after SKILL.md edits + count all tool calls ──────────────
-    "tool.execute.after": async (input, _output) => {
+    await ctx.tool.hook("execute.after", async (event) => {
       try {
-        try {
-          const debugLogPath = path.join(STATE_DIR, "logs", "plugin-debug.log")
-          const rawSid = (input as any)?.sessionID
-          fs.appendFileSync(debugLogPath, JSON.stringify({
-            ts: new Date().toISOString(),
-            tool: input.tool,
-            sessionID: rawSid,
-            sessionID_type: typeof rawSid,
-            sessionID_length: typeof rawSid === "string" ? rawSid.length : null,
-            input_keys: Object.keys(input),
-            metadata_keys: (input as any)?.metadata ? Object.keys((input as any).metadata) : [],
-          }) + "\n")
-        } catch {}
+        const sid = String(event.sessionID)
+        const args = event.input as any
 
-        // opencode 1.17+ sometimes passes undefined/truncated sessionID;
-        // resolveSessionId (module-scope helper) handles multiple sources.
-        const sid = resolveSessionId(input)
-
-        bumpCounters(sid, input.tool, input.args)
+        bumpCounters(sid, event.tool)
         const c = counters[sid]
         if (c) {
           updateSessionState(sid, {
@@ -844,9 +770,15 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           })
         }
 
-        if (input.tool === "skill" && typeof input.args?.name === "string") {
+        // `execute.after` cannot reject the call (only `.before` can), so a
+        // failed call is recorded here and consumed by the idle handler.
+        if (event.status === "error") {
+          failureSignals[sid] ??= `tool_error(${event.tool}): ${String(event.error?.message ?? "").slice(0, 200)}`
+        }
+
+        if (event.tool === "skill" && typeof args?.name === "string") {
           const learned = learnedSkillNames()
-          const name = input.args.name
+          const name = args.name
           if (learned.has(name)) {
             bumpUsage(name, "use")
             const state = getSessionState(sid)
@@ -859,144 +791,124 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           }
         }
 
-        if (EDIT_TOOLS.has(input.tool)) {
+        if (EDIT_TOOLS.has(event.tool)) {
           updateSessionState(sid, { last_file_edit_ts: nowIso(), devlog_nudged_at: null })
-        }
 
-        // Validate SKILL.md after edit/write
-        if (EDIT_TOOLS.has(input.tool)) {
-          const fp = input.args?.filePath as string | undefined
+          // Validate SKILL.md after edit/write
+          const fp = args?.filePath as string | undefined
           if (fp && isSkillPath(fp)) {
             const v = validateSkillFrontmatter(fp)
             const name = skillNameFromPath(fp)
             if (!v.ok) {
-              const outcome = rollbackSkill(fp, backupsThisCall[input.callID] ?? null)
-              try {
-                await client.app.log({
-                  body: {
-                    service: "self-improving-skills",
-                    level: "error",
-                    message: `Rollback (${outcome}) for ${name ?? "skill"}: ${v.error}`,
-                  },
-                })
-              } catch { /* logging best-effort */ }
-              // Throw to surface the failure to the agent
-              throw new Error(
+              const outcome = rollbackSkill(fp, backupsThisCall[event.id] ?? null)
+              failureSignals[sid] ??= `skill_validation: ${v.error}`
+              console.error(
                 `[self-improving-skills] SKILL.md validation failed (${v.error}). ` +
-                `Rollback outcome: ${outcome}. ` +
-                `Fix the content (keep it under 30KB — move detail to references/) and try again.`
+                `Rollback outcome: ${outcome}. Fix the content (keep it under 30KB — ` +
+                `move detail to references/) and try again.`
               )
-            }
-            // Valid — bump patch_count, forget-missing cleanup, prune marker
-            if (name) {
+            } else if (name) {
+              // Valid — bump patch_count, forget-missing cleanup, prune marker
               bumpUsage(name, "patch")
               forgetMissingUsage(learnedSkillNames())
             }
           }
         }
+      } catch (err) {
+        // best-effort — hook rejections are defects, not tool failures
+        console.error(`[self-improving-skills] execute.after hook failed: ${String(err)}`)
       } finally {
-        delete backupsThisCall[input.callID]
+        delete backupsThisCall[event.id]
       }
-    },
+    })
 
     // ── Session idle: record outcomes for skills used this session ────────
-    event: async ({ event }) => {
-      // Resolve session ID from multiple plausible payload shapes — opencode
-      // event properties vary across versions and we never want sessionId to
-      // be undefined (which would create a bogus "undefined" key in
-      // nudge_state.json and silently break outcome tracking).
-      const sessionId = resolveEventSessionId(event)
-      // Cast event.type to string — opencode's strict event type union does
-      // not currently include "session.end", but it can fire at runtime and
-      // we use it as a cleanup trigger for in-memory per-session state.
-      const eventType = event.type as string
-      if (eventType === "session.idle" || eventType === "session.end") {
-        // Free per-session in-memory state to prevent unbounded growth of
-        // counters / backupsThisCall over the plugin's lifetime.
-        if (sessionId) {
-          delete counters[sessionId]
-        }
-        if (eventType === "session.end") return
-      }
-      if (eventType !== "session.idle") return
-      if (!sessionId || typeof sessionId !== "string") return
+    // V2 exposes `session.idle` on the event stream; the subscription is
+    // cancelled through the cleanup returned from `setup`.
+    const idleAbort = new AbortController()
+    void (async () => {
       try {
-        const state = getSessionState(sessionId)
-        if (state.outcome_recorded) return
-        const used = state.skills_used ?? []
-        if (used.length === 0) {
-          // Do NOT set outcome_recorded here. session.idle fires every turn,
-          // not just at session end. If we burn the flag now, future skill
-          // uses in this session will never be recorded — which permanently
-          // disables the GEPA evolution loop. Just return and try again on
-          // the next idle.
-          return
-        }
-        let failureSignal: string | null = null
-        try {
-          const resp: any = await (client as any).session.messages({ path: { id: sessionId }, query: { limit: 30 } })
-          const msgs = (resp?.data ?? resp ?? []) as Array<{ info: any; parts: any[] }>
-          const recent = msgs.flatMap(m => (m?.parts ?? [])).slice(-30)
-          for (const p of recent) {
-            const t = p?.type
-            if (t === "tool") {
-              const err = p?.error || p?.metadata?.error
-              if (err) { failureSignal = `tool_error: ${String(err).slice(0, 200)}`; break }
-              if (p?.state === "error") { failureSignal = "tool_state_error"; break }
-            } else if (t === "text") {
-              const txt = p?.text ?? ""
-              if (looksLikeCorrection(txt)) { failureSignal = "user_correction"; break }
+        for await (const event of ctx.event.subscribe({
+          types: ["session.idle"],
+          signal: idleAbort.signal,
+        })) {
+          const sessionId = String(event.data.sessionID)
+          try {
+            const state = getSessionState(sessionId)
+            if (state.outcome_recorded) continue
+            const used = state.skills_used ?? []
+            if (used.length === 0) {
+              // Do NOT set outcome_recorded here. session.idle fires every
+              // turn, not just at session end. Burning the flag now would
+              // permanently disable the GEPA loop for this session.
+              continue
             }
+            const failureSignal = failureSignals[sessionId] ?? null
+            const result: "ok" | "fail" = failureSignal ? "fail" : "ok"
+            for (const skill of used) {
+              recordOutcome(skill, sessionId, result, failureSignal ?? undefined)
+            }
+            updateSessionState(sessionId, { outcome_recorded: true })
+            delete counters[sessionId]
+            delete failureSignals[sessionId]
+          } catch {
+            // best-effort — never crash the event loop
           }
-        } catch { /* reading messages is best-effort */ }
-
-        const result: "ok" | "fail" = failureSignal ? "fail" : "ok"
-        for (const skill of used) {
-          recordOutcome(skill, sessionId, result, failureSignal ?? undefined)
         }
-        updateSessionState(sessionId, { outcome_recorded: true })
       } catch {
-        // best-effort — never crash the event handler
+        // subscription ends on abort/unload
       }
-    },
+    })()
 
     // ── Custom tools ───────────────────────────────────────────────────────
-    tool: {
-      // Trigger distillation: returns the procedure for the agent to follow
-      distill_skill: tool({
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "distill_skill",
         description:
           "Trigger the self-improvement loop: distill reusable techniques from the current session into a learned skill. " +
           "Returns the decision procedure (patch vs create, anti-patterns, SKILL.md format). " +
           "Call this after complex work, debugging wins, or new technique discoveries — OR when the system advisory tells you the work warrants distillation. " +
           "Never use for one-off tasks (specific PR, specific bug, environment-specific workaround).",
-        args: {
-          context: tool.schema.string().describe(
-            "Optional: free-text hint about what technique to focus on, or which existing skill to update."
-          ),
+        input: {
+          type: "object",
+          properties: {
+            context: {
+              type: "string",
+              description:
+                "Optional: free-text hint about what technique to focus on, or which existing skill to update.",
+            },
+          },
+          additionalProperties: false,
         },
         async execute(args, context) {
+          const a = (args ?? {}) as { context?: string }
           const learned = learnedSkillNames()
           const existing = Array.from(learned).sort()
-          const transcriptHint = `This session's transcript can be read via session_read/session_messages using sessionID ${context.sessionID ?? "(unknown)"}.`
+          const transcriptHint = `This session's transcript can be read via session_read/session_messages using sessionID ${String(context.sessionID ?? "(unknown)")}.`
           return {
-            output: JSON.stringify({
+            content: JSON.stringify({
               distilled_skill_directory: SKILLS_DIR,
               existing_learned_skills: existing,
               existing_count: existing.length,
               procedure: DISTILL_PROCEDURE,
               transcript_hint: transcriptHint,
-              user_hint: args.context ?? null,
+              user_hint: a.context ?? null,
               note: "If nothing meets the bar, write nothing and tell the user why in one line. Declining is a valid, common outcome.",
             }, null, 2),
           }
         },
-      }),
+      })
 
-      curator_status: tool({
+      editor.add({
+        name: "curator_status",
         description:
           "Show the current state of the learned-skill library: usage counts, idle/stale/archived statuses, " +
           "and candidates for curation (archival of unused skills). Use when reviewing skill health or before /curate-skills.",
-        args: {},
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
         async execute() {
           const data = loadUsage()
           const learned = learnedSkillNames()
@@ -1019,7 +931,7 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           }
           const cur = loadCurator()
           return {
-            output: JSON.stringify({
+            content: JSON.stringify({
               total_learned: learned.size,
               curator_last_run: cur.last_run,
               curator_run_count: cur.run_count,
@@ -1031,23 +943,31 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             }, null, 2),
           }
         },
-      }),
+      })
 
-      optimize_skill: tool({
+      editor.add({
+        name: "optimize_skill",
         description:
           "GEPA-style skill evolution: gather failure traces for a skill → generate candidate rewrites → judge against rubric → pick Pareto-best → return diff for human approval. " +
           "Call when `evolution_status` shows a skill with high use but high failure rate. " +
           "Returns the procedure; the agent executes the actual rewrite as Edit (which passes through the backup/validate hooks).",
-        args: {
-          name: tool.schema.string().describe(
-            "Skill name to optimize. If empty, the agent should call `evolution_status` first to pick the top candidate."
-          ),
+        input: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description:
+                "Skill name to optimize. If empty, the agent should call `evolution_status` first to pick the top candidate.",
+            },
+          },
+          additionalProperties: false,
         },
         async execute(args) {
-          const target = (args.name ?? "").trim()
+          const a = (args ?? {}) as { name?: string }
+          const target = (a.name ?? "").trim()
           if (!target) {
             return {
-              output: JSON.stringify({
+              content: JSON.stringify({
                 error: "missing_skill_name",
                 hint: "Call `evolution_status` first to pick the top candidate, then re-invoke with its name.",
               }),
@@ -1058,7 +978,7 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           // file named SKILL.md on the system via this tool's readFileSync.
           if (!/^[a-z0-9][a-z0-9-]*$/i.test(target)) {
             return {
-              output: JSON.stringify({
+              content: JSON.stringify({
                 error: "invalid_skill_name",
                 hint: `Skill name must match /^[a-z0-9][a-z0-9-]*$/i — got "${target.slice(0, 64)}"`,
               }),
@@ -1067,16 +987,16 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           const skillPath = path.join(SKILLS_DIR, target, "SKILL.md")
           const resolved = path.resolve(skillPath)
           if (!resolved.startsWith(SKILLS_DIR + path.sep)) {
-            return { output: JSON.stringify({ error: "path traversal blocked" }) }
+            return { content: JSON.stringify({ error: "path traversal blocked" }) }
           }
           if (!fs.existsSync(skillPath)) {
-            return { output: JSON.stringify({ error: `Skill not found: ${skillPath}` }) }
+            return { content: JSON.stringify({ error: `Skill not found: ${skillPath}` }) }
           }
           const outcomes = loadOutcomes()
           const outcome = outcomes.skills[target]
           const usage = (loadUsage()[target] as UsageRecord) ?? null
           return {
-            output: JSON.stringify({
+            content: JSON.stringify({
               target,
               skill_path: skillPath,
               current_skill: fs.readFileSync(skillPath, "utf-8"),
@@ -1091,13 +1011,18 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             }, null, 2),
           }
         },
-      }),
+      })
 
-      evolution_status: tool({
+      editor.add({
+        name: "evolution_status",
         description:
           "Show outcome stats (success/failure counts) and optimization-candidate ranking for learned skills. " +
           "Use this before optimize_skill to pick the right target, or to monitor skill health.",
-        args: {},
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
         async execute() {
           const usage = loadUsage()
           const outcomes = loadOutcomes()
@@ -1123,7 +1048,7 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           }
           rows.sort((a, b) => b.priority - a.priority)
           return {
-            output: JSON.stringify({
+            content: JSON.stringify({
               total_skills: learned.size,
               ranking: rows,
               top_candidate: rows[0]?.priority > 0 && (rows[0]?.fail ?? 0) > 0
@@ -1135,48 +1060,40 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             }, null, 2),
           }
         },
-      }),
+      })
 
-      mark_skill_optimized: tool({
+      editor.add({
+        name: "mark_skill_optimized",
         description:
           "INTERNAL — call this after applying an optimized rewrite to a skill, so the plugin records the optimization timestamp. " +
           "Do not call directly; the optimize_skill procedure instructs when to use it.",
-        args: {
-          name: tool.schema.string().describe("Skill name that was just optimized."),
+        input: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Skill name that was just optimized." },
+          },
+          required: ["name"],
+          additionalProperties: false,
         },
         async execute(args) {
-          const name = (args.name ?? "").trim()
-          if (!name) return { output: JSON.stringify({ error: "missing name" }) }
+          const a = (args ?? {}) as { name?: string }
+          const name = (a.name ?? "").trim()
+          if (!name) return { content: JSON.stringify({ error: "missing name" }) }
           markOptimized(name)
-          return { output: JSON.stringify({ ok: true, skill: name, optimized_at: nowIso() }) }
+          return { content: JSON.stringify({ ok: true, skill: name, optimized_at: nowIso() }) }
         },
-      }),
-    },
-  }
-}
+      })
+    })
 
-function resolveSessionId(inp: any): string {
-  // opencode 1.17+ sometimes passes undefined/truncated sessionID in tool
-  // hook payloads; resolve from multiple sources. Returns "_unknown_session"
-  // (a stable string key) when nothing is available — never undefined, so
-  // downstream map access can't produce a bogus "undefined" key.
-  const direct = inp?.sessionID
-  if (typeof direct === "string" && direct.length >= 8) return direct
-  const metaSid = inp?.metadata?.sessionID
-  if (typeof metaSid === "string" && metaSid.length >= 8) return metaSid
-  const metaSession = inp?.metadata?.session
-  if (typeof metaSession === "string" && metaSession.length >= 8) return metaSession
-  const envSid =
-    process.env.OPOCODE_SESSION_ID ||
-    process.env.OPENCODE_SESSION_ID ||
-    process.env.SESSION_ID
-  if (typeof envSid === "string" && envSid.length >= 8) return envSid
-  return "_unknown_session"
-}
+    return () => {
+      idleAbort.abort()
+    }
+  },
+})
 
 // ── Nudge target resolution (shared by delivery channels) ─────────────────
-// currentSid null/"_unknown_session" (messages.transform gets no sessionID)
-// → fall back to most recently active qualifying session (30min window).
+// currentSid null/"_unknown_session" → fall back to most recently active
+// qualifying session (30min window).
 type NudgeTarget = { sid: string; s: NudgeState["sessions"][string] }
 
 function pickNudgeTarget(
@@ -1216,23 +1133,6 @@ function buildNudgeText(t: NudgeTarget): string {
   )
 }
 
-function resolveEventSessionId(event: any): string | null {
-  const candidates = [
-    event?.properties?.sessionID,
-    event?.properties?.sessionId,
-    event?.properties?.session?.id,
-    event?.properties?.session,
-    event?.payload?.sessionID,
-    event?.payload?.sessionId,
-    event?.sessionID,
-    event?.sessionId,
-  ]
-  for (const c of candidates) {
-    if (typeof c === "string" && c.length >= 8) return c
-  }
-  return null
-}
-
 function countLearnedSkills(): number {
   let n = 0
   try {
@@ -1248,4 +1148,3 @@ function countLearnedSkills(): number {
   return n
 }
 
-export default SelfImprovingSkills
