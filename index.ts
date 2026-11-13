@@ -322,14 +322,35 @@ function recordOutcome(skill: string, sessionId: string, result: "ok" | "fail", 
 function markOptimized(skill: string): void {
   try {
     const data = loadOutcomes()
+    // The rewrite replaces the measured artifact, so the old sample belongs to
+    // a different skill version. Clearing it is what "optimized" means here:
+    // the next window is measured entirely against the new text, and
+    // `priority = use * smoothed` starts from zero instead of keeping the
+    // skill pinned as `top_candidate` on pre-rewrite failures.
+    const rec = data.skills[skill]
+    if (rec) {
+      rec.ok = 0
+      rec.fail = 0
+      rec.fail_signals = []
+      rec.sessions = {}
+      rec.last_outcome_at = null
+    }
     data._meta.optimized_at[skill] = nowIso()
-    // Reset the evolution cooldown so the just-optimized version gets a fresh
-    // 24h window to accumulate new outcomes before being re-nudged. Without
-    // this, the old cooldown timestamp from before the rewrite would still
-    // gate the next nudge, causing over-eager re-nudging of a skill whose
-    // new version hasn't been exercised yet.
+    // A fresh window also needs a fresh cooldown: without this, the pre-rewrite
+    // nudge timestamp would gate the next nudge and the new version would never
+    // be re-evaluated.
     data._meta.evolution_nudge_at[skill] = nowIso()
     saveOutcomes(data)
+
+    // use_count is the multiplier in that same ranking, so it is part of the
+    // window too. view_count/patch_count measure exposure and upkeep, not
+    // success, and stay cumulative.
+    const usage = loadUsage()
+    const u = usage[skill] as UsageRecord | undefined
+    if (u && typeof u === "object" && "use_count" in u) {
+      u.use_count = 0
+      saveUsage(usage)
+    }
   } catch { /* best-effort */ }
 }
 

@@ -79,7 +79,7 @@ After approval:
 - Use `edit` (or `write` if wholesale replacement is cleaner) on `~/.config/opencode/skills/<name>/SKILL.md`.
 - The plugin's `tool.execute.before` hook will **automatically back up** the previous version.
 - The plugin's `tool.execute.after` hook will **automatically validate** frontmatter and roll back on failure.
-- After successful edit, call `mark_skill_optimized(name="<name>")` — this stamps `optimized_at` so future `evolution_status` runs can compare before/after outcomes.
+- After successful edit, call `mark_skill_optimized(name="<name>")` — this stamps `optimized_at` and resets that skill's measurement window (`use`/`ok`/`fail` → 0), so the next outcomes are measured purely against the rewritten version.
 
 Summarize in 2–3 lines: what changed, which failures it targets, what to watch for next.
 

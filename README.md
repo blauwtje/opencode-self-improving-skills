@@ -50,7 +50,7 @@ The plugin registers these tools (callable by the agent, no user prompt needed f
 | `curator_status` | on-demand | Show learned skills + usage + idle/stale states |
 | `optimize_skill` | ✅ (via evolution-candidate nudge) | Run GEPA-style evolution for one skill |
 | `evolution_status` | on-demand | Show outcome stats + optimization ranking |
-| `mark_skill_optimized` | internal | Stamp `optimized_at` after applying a rewrite |
+| `mark_skill_optimized` | internal | Stamp `optimized_at` and start a fresh outcome window (resets `use`/`ok`/`fail`) |
 
 ## Skills shipped
 
